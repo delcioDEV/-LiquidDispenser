@@ -1,176 +1,180 @@
 #include <WiFi.h>
+#include <WebServer.h>
 #include <HTTPClient.h>
-#include <MFRC522.h>
-#include <otadrive_esp.h>
-#include <Arduino_MultiWiFi.h>
 
-#define relay 2
-#define button 12
-#define buzzer 4
-#define red_led 21
-#define green_led 15
+const char* ssid = "**YOUR-WIFI-CREDENTIALS**";
+const char* password = "**YOUR-WIFI-PASSWORD**";
+
+WebServer server(80);
+
+const int flowSensorPin = 39;
+const int valvePin = 12;
+const int LED = LED_BUILTIN;
+
+const char* serverName = "http://192.168.2.87";
+const int serverPort = 80;
+const char* endpoint = "/AutoBeer/getdata.php";
+
+volatile int pulseCount = 0;
+float flowRate = 0.0;
+float volume = 0.0;
+float calibrationFactor = 5.8;
 
 
-#define RFID_SDA 5
-#define RFID_SCK 18
-#define RFID_MOSI 23
-#define RFID_MISO 19
-#define RFID_RST 22
 
-MFRC522 mfrc522(RFID_SDA, RFID_RST);
+bool targetfill, fill = false;
+float targetVolume = 0.0;
+String targetTagUid = "";
 
-const char* ssid = "PowerSolution";                 // Replace with your WiFi network SSID
-const char* password = "p@wers0lution2020";         // Replace with your WiFi network password
-const char* server = "http://192.168.2.83/submit";  // Replace with your server's URL
+float previousTargetVolume = 0.0;
 
-MultiWiFi multi;
+void IRAM_ATTR pulseCounter() {
+  pulseCount++;
+}
 
-void initWiFi(void);
-void post(String params);
-void reconnectWiFi(void);
-void blink(int led, int time, int sec);
+void blink(int times, float interval);
+
+void handleRoot() {
+  String html = "<html><body><h1>AutoBeer Dispenser</h1>";
+  html += "<form method='post' action='/submit'>";
+  html += "<label for='tag_uid'>Enter the tag UID:</label><br>";
+  html += "<input type='text' id='tag_uid' name='tag_uid'><br>";
+  html += "<label for='volume'>Enter the desired volume (in l):</label><br>";
+  html += "<input type='text' id='volume' name='volume'><br>";
+  html += "<input type='submit' value='Submit'>";
+  html += "</form></body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleSubmit() {
+  bool fill = server.arg("fill");
+  targetfill = fill;
+  String tagUidStr = server.arg("tag_uid");
+  targetTagUid = tagUidStr;
+  String volumeStr = server.arg("volume");
+  targetVolume = volumeStr.toFloat();
+  Serial.print("New target volume: ");
+  Serial.println(targetVolume);
+  server.send(200, "text/plain", "Filling: " + String(targetfill) + " and volume set to " + volumeStr + " ml.");
+}
+
 
 void setup() {
   Serial.begin(115200);
-  SPI.begin();         // Inicia  SPI bus
-  mfrc522.PCD_Init();  // Inicia MFRC522
-
-  // Configure the known networks (first one gets higher priority)
-  multi.add("PowerSolution", "p@wers0lution2020");
-  multi.add("Unitel T+ Net CT2065226245", "FFU47J0Y8V");
-
-  Serial.println("Aproxime o seu cartao do leitor...");
-  Serial.println();
-  initWiFi();
-
-  OTADRIVE.setInfo("2a831bdb-fee1-4528-861a-915bd7868631", "v@1.1.1");
-}
-
-void ota() {
-  if (OTADRIVE.timeTick(3600000)) {
-    OTADRIVE.updateFirmware();
-    Serial.print("update check running...");
-    blink(red_led, 4, 600);  //blink the red led each sec when updating
+  pinMode(flowSensorPin, INPUT_PULLUP);
+  pinMode(valvePin, OUTPUT);
+  pinMode(LED, OUTPUT);
+  attachInterrupt(digitalPinToInterrupt(flowSensorPin), pulseCounter, FALLING);
+  WiFi.config(IPAddress(192, 168, 2, 83), IPAddress(192, 168, 0, 1), IPAddress(255, 255, 255, 0), IPAddress(8, 8, 8, 8));
+ 
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    blink(2,1);
+    Serial.println("Connecting to WiFi...");
   }
+  Serial.println();
+  Serial.print("Connected to WiFi with IP address: ");
+  Serial.println(WiFi.localIP());
+  server.on("/", handleRoot);
+  server.on("/submit", handleSubmit);
+  server.begin();
 }
 
 void loop() {
+  blink(1,0.5);
+  server.handleClient();
 
-  ota();
-  /* Initialize MFRC522 Module */
-  mfrc522.PCD_Init();
-  /* Look for new cards */
-  /* Reset the loop if no new card is present on RC522 Reader */
-  if (!mfrc522.PICC_IsNewCardPresent()) { return; }
-  /* Select one of the cards */
-  if (!mfrc522.PICC_ReadCardSerial()) { return; }
-  /* Read data from the same block */
-  //--------------------------------------------------
-  //show UID on serial
-  digitalWrite(buzzer, HIGH);
-  delay(250);
-  digitalWrite(buzzer, LOW);
-
-  Serial.print("UID da tag :");
-  String conteudo = "";
-  for (byte i = 0; i < mfrc522.uid.size; i++) {
-    conteudo.concat(String(mfrc522.uid.uidByte[i], DEC));
+  // Check if target volume has changed
+  if (targetVolume != previousTargetVolume) {
+    // Update target volume
+    previousTargetVolume = targetVolume;
+    volume = 0.0;  // Reset volume counter
+    Serial.print("New target volume: ");
+    Serial.println(targetVolume);
   }
 
-  Serial.println();
-  Serial.print("Mensagem : ");
 
+  // Dispense beer if target volume is set and not reached
+  unsigned long startTime = millis();
+  while (targetVolume > volume && targetfill) {
+    digitalWrite(valvePin, HIGH);
+   
+    detachInterrupt(digitalPinToInterrupt(flowSensorPin));
+        
+        flowRate = ((float)pulseCount / calibrationFactor) * 60.0;
+        volume += (flowRate / 60000.0)  ;
+        pulseCount = 0;
+        attachInterrupt(digitalPinToInterrupt(flowSensorPin), pulseCounter, FALLING);
+        
+      // Print flow rate and volume
+    Serial.print("Flow rate: ");
+    Serial.print(flowRate);
+    Serial.print(" mL/s, Volume: ");
+    Serial.print(volume);
+    Serial.println(" mL");
+    Serial.print(" mL, targerVolume: ");
+    Serial.print(targetVolume);
+    Serial.println(" mL");
+    break;
+  }
 
-  post(conteudo);
+  // Set the fill variable to false if targetfill is false
+  if (!targetfill) {
+    Serial.println("fil stp");
+   // digitalWrite(valvePin, LOW);
+    fill = false;
+    // Reset target fill flag and volume when target volume is reached
+    targetfill = false;
+    targetVolume = 0.0;
+  }
 
-  delay(100);
+  if (targetVolume <= volume) {
+  Serial.println("fill stp");
+  digitalWrite(valvePin, LOW);
+  sendVolume(volume);
+  fill = false;
+  // Reset target fill flag and volume when target volume is reached
+  targetfill = false;
+  targetVolume = 0.0;
+
+  // Reset all other variables to 0
+  pulseCount = 0;
+  flowRate = 0.0;
+  volume = 0.0;
+  
+  targetTagUid = "";
+  previousTargetVolume = 0.0;
 }
 
-void post(String params) {
-  // Send a POST request to the server with the tag UID
-  // HTTPClient http;
-  // http.begin(server);
-  // http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-  // String postData = "tag_uid=" + params+ "volume=0.35&fill=1";
-  // Serial.print(server);
-  // Serial.print(postData);
-  // int httpResponseCode = http.POST(postData);
-  // if (httpResponseCode > 0) {
-  //   Serial.printf("POST request sent with tag UID: %s (HTTP response code: %d)\n", params.c_str(), httpResponseCode);
-  // } else {
-  //   Serial.printf("POST request failed with tag UID: %s (HTTP response code: %d)\n", params.c_str(), httpResponseCode);
-  // }
-  // http.end();
+}
 
+void sendVolume(float volume) {
   HTTPClient http;
-  http.begin(server);
-
-  // Set the Content-Type header to multipart/form-data
-  http.addHeader("Content-Type", "multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW");
-
-  // Create the form-data payload
-  String payload = "";
-  payload += "------WebKitFormBoundary7MA4YWxkTrZu0gW\r\n";
-  payload += "Content-Disposition: form-data; name=\"tag_uid\"\r\n\r\n";
-  payload += params + "\r\n";
-  payload += "------WebKitFormBoundary7MA4YWxkTrZu0gW\r\n";
-  payload += "Content-Disposition: form-data; name=\"volume\"\r\n\r\n";
-  payload += "0.35\r\n";
-  payload += "------WebKitFormBoundary7MA4YWxkTrZu0gW\r\n";
-  payload += "Content-Disposition: form-data; name=\"fill\"\r\n\r\n";
-  payload += "1\r\n";
-  payload += "------WebKitFormBoundary7MA4YWxkTrZu0gW--\r\n";
-
-  // Send the POST request with the form-data payload
+  String url = String(serverName) + String(endpoint);
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  String payload = "{\"volume\": " + String(volume, 2) + "}";
+  Serial.println("SERVER:");
+  Serial.print(url);
+  Serial.println("payload:");
+  Serial.print(payload);
   int httpResponseCode = http.POST(payload);
-
-  // Check if the request was successful
   if (httpResponseCode > 0) {
-    Serial.printf("POST request sent with tag UID: %s (HTTP response code: %d)\n", params.c_str(), httpResponseCode);
+    Serial.print("HTTP Response code: ");
+    Serial.println(httpResponseCode);
   } else {
-    Serial.printf("POST request failed with tag UID: %s (HTTP response code: %d)\n", params.c_str(), httpResponseCode);
+    Serial.print("Error code: ");
+    Serial.println(httpResponseCode);
   }
-
-  // End the HTTP session
   http.end();
 }
 
-void initWiFi(void) {
-  delay(10);
-  Serial.println("------Conexao WI-FI------");
-  Serial.println("Aguarde");
-  reconnectWiFi();
-}
-
-void reconnectWiFi(void) {
-  if (WiFi.status() == WL_CONNECTED)
-    return;
-
-  //WiFi.begin(wifi_ssid, wifi_password);
-
-
-  // Connect to the first available network
-  Serial.println("Looking for a network...");
-  if (multi.run() == WL_CONNECTED) {
-    Serial.print("Successfully connected to network: ");
-    Serial.println(WiFi.SSID());
-
-  } else {
-    Serial.println("Failed to connect to a WiFi network");
-    blink(red_led, 3, 250);  // Blink the red LED 3 times with a delay of 250 milliseconds
-  }
-  blink(green_led, 3, 250);
-  Serial.println();
-  Serial.print("Conectado com sucesso na rede ");
-  Serial.println("IP obtido: ");
-  Serial.println(WiFi.localIP());
-}
-
-void blink(int led, int time, int sec){
-  for(int i=0; i<time; i++){
-    digitalWrite(led, HIGH);
-    delay(sec);
-    digitalWrite(led, LOW);
-    delay(sec);
+void blink(int times,float interval){
+  interval *=1000;
+  for(int i=0;i<times;i++){
+    digitalWrite(LED,HIGH);
+    delay(250);
+    digitalWrite(LED,LOW);
   }
 }
